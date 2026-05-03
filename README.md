@@ -4,7 +4,7 @@ This repository provides an automated backup script for TrueNAS SCALE configurat
 
 ## Features
 
-- **Automated config backups** using the TrueNAS API
+- **Automated config backups** using the TrueNAS WebSocket API (`/api/current`)
 - **Optionally includes Secret Seed** for full disaster recovery
 - **Backup retention**: automatically deletes oldest backups beyond a set limit
 - **Git integration**: stores backups in a Git repository and pushes to GitHub
@@ -13,7 +13,7 @@ This repository provides an automated backup script for TrueNAS SCALE configurat
 ## Prerequisites
 
 - Bash shell (Linux/UNIX environment, tested on TrueNAS SCALE)
-- curl
+- python3 (standard library only – no extra packages required)
 - git
 - A GitHub repository for remote backup storage
 - TrueNAS API key with config backup permissions
@@ -55,7 +55,7 @@ This repository provides an automated backup script for TrueNAS SCALE configurat
 ## How it Works
 
 - Retrieves the current TrueNAS version to create versioned backup directories
-- Uses the TrueNAS API to download the config file (optionally with Secret Seed)
+- Uses the TrueNAS WebSocket API (`/api/current`) to download the config file (optionally with Secret Seed)
 - Stores the backup file in `$backuploc/<version>/`
 - Keeps only the latest `$maxnrOfFiles` backups (unless set to 0)
 - Initializes a Git repo (if needed), commits changes, and pushes to your remote GitHub repo

@@ -8,6 +8,8 @@
 # If a valid backup file is not created then there is something wrong with the API call
 # Check that your URL and API Key are both correct
 #
+# Uses the TrueNAS WebSocket API (/api/current) to avoid the deprecated REST API (/api/v2.0/)
+#
 
 
 # # # # # # # # # # # # # # # #
@@ -66,15 +68,133 @@ fi
 fileName=$(hostname)-TrueNAS-$(date +%Y%m%d).$fileExt
 
 
-# API call to backup config and include secret seed
-curl --no-progress-meter \
--X 'POST' \
-$serverURL'/api/v2.0/config/save' \
--H 'Authorization: Bearer '$apiKey \
--H 'accept: */*' \
--H 'Content-Type: application/json' \
--d '{"secretseed": '$secSeed'}' \
---output $backupMainDir/$fileName
+# WebSocket API call to backup config (replaces deprecated REST /api/v2.0/config/save)
+TRUENAS_SERVER="$serverURL" \
+TRUENAS_API_KEY="$apiKey" \
+TRUENAS_SEC_SEED="$secSeed" \
+TRUENAS_OUTPUT="$backupMainDir/$fileName" \
+python3 - << 'PYEOF'
+import sys, json, ssl, socket, struct, base64, os, urllib.request
+
+server   = os.environ["TRUENAS_SERVER"].rstrip("/")
+api_key  = os.environ["TRUENAS_API_KEY"]
+sec_seed = os.environ["TRUENAS_SEC_SEED"].lower() == "true"
+out_file = os.environ["TRUENAS_OUTPUT"]
+
+use_ssl   = server.startswith("https://")
+host_part = server.replace("https://", "").replace("http://", "")
+host, _, port_s = host_part.partition(":")
+port = int(port_s) if port_s else (443 if use_ssl else 80)
+
+# Open TCP connection (with TLS when needed)
+# SSL certificate verification is disabled to support self-signed certificates,
+# which are common on home TrueNAS deployments. Set verify_mode = ssl.CERT_REQUIRED
+# and check_hostname = True if your server uses a trusted certificate.
+sock = socket.create_connection((host, port), timeout=60)
+if use_ssl:
+    tls_ctx = ssl.create_default_context()
+    tls_ctx.check_hostname = False
+    tls_ctx.verify_mode = ssl.CERT_NONE
+    sock = tls_ctx.wrap_socket(sock, server_hostname=host)
+
+# WebSocket opening handshake
+ws_key = base64.b64encode(os.urandom(16)).decode()
+sock.sendall((
+    "GET /api/current HTTP/1.1\r\n"
+    "Host: {}\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Key: {}\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "\r\n"
+).format(host, ws_key).encode())
+
+buf = b""
+while b"\r\n\r\n" not in buf:
+    chunk = sock.recv(4096)
+    if not chunk:
+        print("Connection closed during WebSocket handshake", file=sys.stderr)
+        sys.exit(1)
+    buf += chunk
+first_line = buf.split(b"\r\n")[0].decode("utf-8", errors="replace")
+if "101" not in first_line:
+    print("WebSocket upgrade failed: " + first_line, file=sys.stderr)
+    sys.exit(1)
+
+def read_exact(n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("Connection closed unexpectedly")
+        data += chunk
+    return data
+
+def ws_send(msg):
+    payload = msg.encode("utf-8")
+    n, mask = len(payload), os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    if n < 126:
+        header = bytes([0x81, 0x80 | n])
+    elif n < 65536:
+        header = bytes([0x81, 0xFE]) + struct.pack(">H", n)
+    else:
+        header = bytes([0x81, 0xFF]) + struct.pack(">Q", n)
+    sock.sendall(header + mask + masked)
+
+def ws_recv():
+    while True:
+        hdr = read_exact(2)
+        opcode = hdr[0] & 0x0F
+        length = hdr[1] & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", read_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", read_exact(8))[0]
+        payload = read_exact(length)
+        if opcode == 0x9:  # ping - reply with pong
+            mask = os.urandom(4)
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            sock.sendall(bytes([0x8A, 0x80 | len(payload)]) + mask + masked)
+            continue
+        if opcode == 0xA:  # pong - ignore
+            continue
+        if opcode == 0x8:  # close
+            raise ConnectionError("Server closed the WebSocket connection")
+        return payload.decode("utf-8")
+
+# Authenticate with API key (JSON-RPC 2.0)
+ws_send(json.dumps({"jsonrpc": "2.0", "id": 1,
+                    "method": "auth.login_with_api_key", "params": [api_key]}))
+auth = json.loads(ws_recv())
+if not auth.get("result"):
+    sock.close()
+    print("Authentication failed – check your API key.", file=sys.stderr)
+    sys.exit(1)
+
+# Request config download via core.download
+ws_send(json.dumps({"jsonrpc": "2.0", "id": 2,
+                    "method": "core.download",
+                    "params": ["config.save", [{"secretseed": sec_seed}], "truenas.db"]}))
+dl = json.loads(ws_recv())
+sock.close()
+
+if "error" in dl:
+    print("core.download error: " + str(dl["error"]), file=sys.stderr)
+    sys.exit(1)
+
+download_path = dl["result"][1]
+dl_url = download_path if download_path.startswith("http") else server + download_path
+
+# Download the config file via HTTP (SSL verification also disabled for the same reason)
+dl_ctx = ssl.create_default_context()
+dl_ctx.check_hostname = False
+dl_ctx.verify_mode = ssl.CERT_NONE
+req = urllib.request.Request(dl_url, headers={"Authorization": "Bearer " + api_key})
+with urllib.request.urlopen(req, context=dl_ctx) as resp:
+    with open(out_file, "wb") as f:
+        f.write(resp.read())
+PYEOF
 
 echo
 echo "Config saved to ${backupMainDir}/${fileName}"
