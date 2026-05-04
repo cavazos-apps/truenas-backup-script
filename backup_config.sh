@@ -17,7 +17,7 @@
 # # # # # # # # # # # # # # # #
 
 
-# Server IP or URL (include http(s)://)
+# HTTPS Server IP or URL (include https://)
 serverURL=""
 
 # TrueNAS API key (Generate from 'User Icon' -> 'API Keys' in TrueNAS WebGUI)
